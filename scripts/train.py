@@ -90,6 +90,7 @@ def sample_groups(agent, dataset, n_prompts, cfg, device, cursor):
         "full_ids": full_ids[:cfg.group_size],
         "response_spans": response_spans[:cfg.group_size],
     }
+    mean_len = float(np.mean(comp_lens)) if comp_lens else 0.0
 
     groups = []
     zero_var = 0
@@ -113,7 +114,7 @@ def sample_groups(agent, dataset, n_prompts, cfg, device, cursor):
             "zero_adv": is_zero_var,
         })
 
-    return groups, results, zero_var, probe
+    return groups, results, zero_var, probe, mean_len
 
 
 def save_checkpoint(agent, optimizer, cfg, step, cursor, tag) -> str:
@@ -215,10 +216,12 @@ def train():
         zero_var_total = 0
         candidate_groups = 0
         probe = None
+        gen_len_sum = 0.0
+        gen_len_n = 0
 
         while candidate_groups < budget and len(valid_groups) < cfg.groups_per_step:
             need = cfg.groups_per_step - len(valid_groups)
-            groups, results, zero_var, probe_i = sample_groups(
+            groups, results, zero_var, probe_i, mlen = sample_groups(
                 agent, train_data, need, cfg, device, cursor)
             if probe is None:
                 probe = probe_i
@@ -227,6 +230,8 @@ def train():
             all_results.extend(results)
             zero_var_total += zero_var
             candidate_groups += need
+            gen_len_sum += mlen * len(results)
+            gen_len_n += len(results)
             if not cfg.dynamic_sampling:
                 break
 
@@ -245,7 +250,7 @@ def train():
         # entropy bonus is off; skip their forward/backward passes entirely
         # (late in vanilla training ~65% of groups are zero-variance).
         skip_zero_adv = (cfg.beta == 0.0) and (not cfg.entropy_reg)
-        p_losses, kl_ests, clip_fracs, surprises, comp_lens = [], [], [], [], []
+        p_losses, kl_ests, clip_fracs, surprises = [], [], [], []
 
         for group in valid_groups:
             if group["full_ids"].numel() == 0:
@@ -283,7 +288,6 @@ def train():
                 kl_ests.append(kl_est)
                 clip_fracs.append(clip_frac)
                 surprises.append(surprisal)
-                comp_lens.append(np.mean(group["completion_lengths"]))
 
         # ---- diagnostics ---------------------------------------------------
         hack_rates = aggregate_hack_rates(all_results)
@@ -292,7 +296,7 @@ def train():
             "rollout/kl_vs_ref": float(np.mean(kl_ests)) if kl_ests else 0.0,
             "rollout/mean_sampled_token_surprisal": float(np.mean(surprises)) if surprises else 0.0,
             "rollout/policy_entropy": float(policy_entropy),
-            "rollout/mean_completion_tokens": float(np.mean(comp_lens)) if comp_lens else 0.0,
+            "rollout/mean_completion_tokens": (gen_len_sum / gen_len_n) if gen_len_n else 0.0,
             "rollout/zero_variance_group_ratio": zero_var_ratio,
             "rollout/effective_group_ratio": effective_group_ratio,
             "rollout/oversample_ratio": oversample_ratio,
