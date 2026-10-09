@@ -1,0 +1,13 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# experiment artifacts
+swanlog/
+datasets/
+eval-results/
+outputs/
+*.jsonl
+.DS_Store
