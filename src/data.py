@@ -119,7 +119,11 @@ def build_synthetic(n: int) -> List[dict]:
 
 def _load_gsm8k(split: str = "train") -> List[dict]:
     from datasets import load_dataset
-    ds = load_dataset("gsm8k", "main", split=split)
+    try:
+        ds = load_dataset("openai/gsm8k", "main", split=split)
+    except Exception:
+        # older mirrors may still serve the pre-migration bare name
+        ds = load_dataset("gsm8k", "main", split=split)
     out = []
     for ex in ds:
         s = _make_sample(ex["question"], ex["answer"], "gsm8k", "gsm8k",

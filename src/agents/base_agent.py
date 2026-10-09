@@ -78,10 +78,12 @@ class BaseAgent(nn.Module):
 
     def get_policy_log_probs(self, full_ids, response_spans, use_amp=False):
         attention_mask = (full_ids != self.tokenizer.pad_token_id).to(full_ids.device).long()
+        # MPS: fp32 activations, keep the transient vocab-sized log-softmax small
+        row_chunk = 4 if self.device.type == "mps" else 8
         return compute_log_probs_for_tokens(
             self.policy_model, full_ids, response_spans,
             attention_mask=attention_mask, use_amp=use_amp,
-            device=str(self.device),
+            device=str(self.device), row_chunk=row_chunk,
         )
 
     @torch.no_grad()
