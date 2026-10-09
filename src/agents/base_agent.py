@@ -42,6 +42,15 @@ class BaseAgent(nn.Module):
             else:
                 self.policy_model = self._wrap_lora(self.policy_model, lora_config, use_8bit)
 
+        # Gradient checkpointing: retaining 24 layers x full-sequence
+        # activations for an 8-row training group (prompt ~512 + response 384)
+        # needs ~15 GiB on 18GB-class devices (MPS / T4) and OOMs the backward
+        # pass; recomputing them instead peaks ~3.5 GiB. no_grad passes
+        # (generation, eval, entropy probe) are unaffected, and `train()`-mode
+        # gate means generate() keeps its KV cache.
+        self.policy_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
         self.policy_model.to(self.device)
         self.policy_model.eval()
 

@@ -15,7 +15,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.losses import grpo_loss  # noqa: E402
-from src.generation import compute_entropy_for_tokens  # noqa: E402
+from src.generation import (  # noqa: E402
+    compute_entropy_for_tokens,
+    compute_log_probs_for_tokens,
+)
 from src.data import (  # noqa: E402
     _extract_gt_auto,
     _extract_gt_gsm8k,
@@ -73,18 +76,23 @@ class _UniformStub(torch.nn.Module):
         super().__init__()
         self.vocab = vocab
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, logits_to_keep=0):
         b, t = input_ids.shape
-        return _StubOutput(torch.zeros(b, t, self.vocab))
+        logits = torch.zeros(b, t, self.vocab)
+        if logits_to_keep:
+            logits = logits[:, -logits_to_keep:, :]
+        return _StubOutput(logits)
 
 
 class _PeakedStub(torch.nn.Module):
     """Every position: all mass on token 0 -> H ~ 0."""
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, logits_to_keep=0):
         b, t = input_ids.shape
         logits = torch.zeros(b, t, 4)
         logits[..., 0] = 20.0
+        if logits_to_keep:
+            logits = logits[:, -logits_to_keep:, :]
         return _StubOutput(logits)
 
 
@@ -110,6 +118,68 @@ def test_entropy_ignores_non_response_positions():
     ent = compute_entropy_for_tokens(_UniformStub(vocab=8), full_ids, spans,
                                      device="cpu")
     assert ent == pytest.approx(math.log(8), abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# logits_to_keep trailing-slice (MPS OOM fix): log probs must be identical to
+# a full-sequence computation even with left padding + variable response ends
+# ---------------------------------------------------------------------------
+class _PositionalStub(torch.nn.Module):
+    """Position-dependent logits so a wrong slice offset changes the answer."""
+
+    def __init__(self, vocab=6):
+        super().__init__()
+        self.vocab = vocab
+
+    def forward(self, input_ids, attention_mask=None, logits_to_keep=0):
+        b, t = input_ids.shape
+        pos = torch.arange(t).view(1, t, 1).float()
+        v = torch.arange(self.vocab).view(1, 1, self.vocab).float()
+        logits = 0.01 * pos + 0.001 * v  # deterministic in (t, v)
+        if logits_to_keep:
+            logits = logits[:, -logits_to_keep:, :]
+        return _StubOutput(logits.expand(b, -1, -1).clone())
+
+
+def _manual_log_probs(full_ids, spans, vocab=6):
+    """Full-sequence reference computation (no slicing)."""
+    stub = _PositionalStub(vocab)
+    out = []
+    logits = stub(full_ids).logits
+    logp = torch.log_softmax(logits, dim=-1)
+    for i, (start, end) in enumerate(spans):
+        if end <= start or start < 1:
+            out.append(torch.tensor([]))
+            continue
+        toks = full_ids[i, start:end]
+        out.append(logp[i, start - 1:end - 1, :].gather(
+            1, toks.unsqueeze(1)).squeeze(1))
+    return out
+
+
+def test_log_probs_trailing_slice_matches_full():
+    torch.manual_seed(0)
+    # left-padded rows: pads, prompt (uniform start=6), variable-length responses
+    full_ids = torch.tensor([
+        [0, 0, 1, 2, 3, 4, 5, 2, 3, 4],   # response (6, 10): full-length
+        [0, 0, 1, 2, 3, 4, 5, 1, 2, 0],   # response (6, 9): one trailing pad
+        [0, 0, 1, 2, 3, 4, 5, 3, 0, 0],   # response (6, 8): early stop
+    ])
+    spans = [(6, 10), (6, 9), (6, 8)]
+    got = compute_log_probs_for_tokens(
+        _PositionalStub(), full_ids, spans, device="cpu", row_chunk=2)
+    want = _manual_log_probs(full_ids, spans)
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        assert torch.allclose(g, w, atol=1e-6)
+
+
+def test_log_probs_empty_span_safe():
+    full_ids = torch.tensor([[1, 2, 3]])
+    got = compute_log_probs_for_tokens(
+        _PositionalStub(), full_ids, [(2, 2)], device="cpu")
+    assert got[0].numel() == 0
 
 
 # ---------------------------------------------------------------------------

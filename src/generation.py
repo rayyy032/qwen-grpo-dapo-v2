@@ -112,13 +112,27 @@ def compute_log_probs_for_tokens(model, full_ids, response_spans,
     n = len(response_spans)
     log_probs_list: list = [None] * n  # type: ignore[assignment]
 
+    # Left padding puts every response at the row tail, and every span shares
+    # the same start; the earliest logits position we ever need is
+    # min(start) - 1. Asking the model for only the last K positions
+    # (``logits_to_keep``) keeps the vocab-sized, autograd-retained activation
+    # at K x vocab instead of seq_len x vocab — the prompt-side lm_head
+    # projection is never materialized. With 512-token prompts and 384-token
+    # responses this is ~57% less retained memory, which is what lets the
+    # training forward fit on an 18GB MPS budget.
+    seq_len = full_ids.size(1)
+    min_start = min((s for s, _ in response_spans), default=seq_len)
+    logits_to_keep = min(max(1, seq_len - min_start + 1), seq_len)
+    offset = seq_len - logits_to_keep  # position p -> sliced index p - offset
+
     for s in range(0, n, row_chunk):
         e = min(s + row_chunk, n)
         with autocast(device_type=device_type, enabled=use_amp):
             outputs = model(
                 input_ids=full_ids[s:e],
                 attention_mask=attention_mask[s:e]
-                if attention_mask is not None else None)
+                if attention_mask is not None else None,
+                logits_to_keep=logits_to_keep)
             logits = outputs.logits
         log_probs_all = torch.log_softmax(logits, dim=-1)
         for i in range(s, e):
@@ -128,7 +142,8 @@ def compute_log_probs_for_tokens(model, full_ids, response_spans,
                 continue
             response_token_ids = full_ids[i, start:end]
             # logits at position t predict token t+1 -> shift by one
-            logits_for_response = log_probs_all[i - s, start - 1: end - 1, :]
+            logits_for_response = log_probs_all[
+                i - s, start - 1 - offset: end - 1 - offset, :]
             token_log_probs = logits_for_response.gather(
                 1, response_token_ids.unsqueeze(1)).squeeze(1)
             log_probs_list[i] = token_log_probs
@@ -161,13 +176,21 @@ def compute_entropy_for_tokens(model, full_ids, response_spans,
     total = 0.0
     count = 0
 
+    # same trailing-slice trick as compute_log_probs_for_tokens: only the
+    # response-side positions need vocab logits
+    seq_len = full_ids.size(1)
+    min_start = min((s for s, _ in response_spans), default=seq_len)
+    logits_to_keep = min(max(1, seq_len - min_start + 1), seq_len)
+    offset = seq_len - logits_to_keep
+
     for s in range(0, len(response_spans), row_chunk):
         e = min(s + row_chunk, len(response_spans))
         with autocast(device_type=device_type, enabled=use_amp):
             outputs = model(
                 input_ids=full_ids[s:e],
                 attention_mask=attention_mask[s:e]
-                if attention_mask is not None else None)
+                if attention_mask is not None else None,
+                logits_to_keep=logits_to_keep)
             logits = outputs.logits.float()
         probs = torch.softmax(logits, dim=-1)
         pos_entropy = torch.logsumexp(logits, dim=-1) \
@@ -176,7 +199,7 @@ def compute_entropy_for_tokens(model, full_ids, response_spans,
             start, end = response_spans[i]
             if end <= start or start < 1:
                 continue
-            seg = pos_entropy[i - s, start - 1: end - 1]
+            seg = pos_entropy[i - s, start - 1 - offset: end - 1 - offset]
             total += float(seg.sum().item())
             count += int(seg.numel())
         del outputs, logits, probs, pos_entropy

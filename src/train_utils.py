@@ -48,3 +48,8 @@ def amp_backward_step(loss, optimizer, scaler, model, max_grad_norm=1.0):
     del loss
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if getattr(torch.backends, "mps", None) is not None \
+            and torch.backends.mps.is_available():
+        # release the per-step autograd buffers back to the system so MPS
+        # allocator fragmentation cannot accumulate into a late-run OOM
+        torch.mps.empty_cache()
