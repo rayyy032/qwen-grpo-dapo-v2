@@ -156,3 +156,41 @@ def test_score_answer_missing_boxed_counts_wrong():
                           enable_overlong=False, is_truncated=False, format_weight=0.2)
     assert result.valid_format is False
     assert result.correct is False
+
+
+# ---------------------------------------------------------------------------
+# degenerate-output floor (overlong module death-spiral fix)
+# ---------------------------------------------------------------------------
+def test_score_answer_empty_output_floored_with_overlong():
+    """No boxed + < empty_min_tokens -> -1, so silence never beats truncation."""
+    result = score_answer("", "42", completion_tokens=3,
+                          max_tokens=1024, overlong_cache=256,
+                          enable_overlong=True, is_truncated=False, format_weight=0.2)
+    assert result.length_penalty == -1.0
+    assert result.shaped_reward == -1.0
+
+
+def test_score_answer_short_boxed_not_floored():
+    """A short *formatted* answer is legitimate and must not hit the floor."""
+    result = score_answer("\\boxed{42}", "42", completion_tokens=3,
+                          max_tokens=1024, overlong_cache=256,
+                          enable_overlong=True, is_truncated=False, format_weight=0.2)
+    assert result.length_penalty == 0.0
+    assert result.shaped_reward == pytest.approx(1.2)
+
+
+def test_score_answer_floor_inactive_without_overlong():
+    """Without overlong shaping the reward scale is unchanged (single-variable)."""
+    result = score_answer("", "42", completion_tokens=3,
+                          max_tokens=1024, overlong_cache=256,
+                          enable_overlong=False, is_truncated=False, format_weight=0.2)
+    assert result.length_penalty == 0.0
+    assert result.shaped_reward == 0.0
+
+
+def test_score_answer_medium_unformatted_not_floored():
+    """Wrong-but-substantive answers only get the ordinary cache penalty."""
+    result = score_answer("long reasoning without any boxed answer", "42",
+                          completion_tokens=30, max_tokens=1024, overlong_cache=256,
+                          enable_overlong=True, is_truncated=False, format_weight=0.2)
+    assert result.length_penalty == 0.0  # below cache window, no floor (>8 tokens)

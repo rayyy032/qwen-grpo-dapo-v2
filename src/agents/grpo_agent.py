@@ -17,8 +17,10 @@ class GRPOAgent(BaseAgent):
     """
 
     def __init__(self, model_path: str, device: str = "cuda", lora_config=None,
-                 use_8bit: bool = False, ref_use_lora: bool = False):
-        super().__init__(model_path, device, lora_config, use_8bit)
+                 use_8bit: bool = False, ref_use_lora: bool = False,
+                 resume_adapter: str = None):
+        super().__init__(model_path, device, lora_config, use_8bit,
+                         resume_adapter=resume_adapter)
 
         self.reference_model = AutoModelForCausalLM.from_pretrained(model_path)
         if ref_use_lora and lora_config is not None:

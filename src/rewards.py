@@ -187,7 +187,8 @@ class ScoreResult:
 
 def score_answer(completion: str, ground_truth: str, completion_tokens: int,
                  max_tokens: int, overlong_cache: int, enable_overlong: bool,
-                 is_truncated: bool, format_weight: float = 0.2) -> ScoreResult:
+                 is_truncated: bool, format_weight: float = 0.2,
+                 empty_min_tokens: int = 8) -> ScoreResult:
     """Score a single completion.
 
     Overlong Reward Shaping (DAPO): the piecewise-linear ``length_penalty``
@@ -197,6 +198,15 @@ def score_answer(completion: str, ground_truth: str, completion_tokens: int,
     truncated responses (``is_truncated``, i.e. hit ``max_new_tokens``)
     saturate at ``-1``.  The truncation flag is passed in and used both to
     guarantee saturation and for the truncation-rate diagnostic.
+
+    Degenerate-output floor (our extension, overlong module only): under the
+    paper's +-1 reward an empty response scores -1 like any wrong answer, so
+    "output nothing" can never beat "attempt and get truncated".  Under our
+    0/1+format reward scale an empty response would otherwise score 0 > -1
+    and become a local optimum — the policy collapses to zero-length
+    outputs (observed in v1 run-3).  Responses with no ``\\boxed{}`` and
+    fewer than ``empty_min_tokens`` tokens are floored at -1 so silence
+    never dominates a substantive attempt.
     """
     boxed = extract_last_boxed(completion)
     valid_format = boxed is not None
@@ -204,6 +214,8 @@ def score_answer(completion: str, ground_truth: str, completion_tokens: int,
 
     if enable_overlong:
         if is_truncated:
+            length_penalty = -1.0
+        elif not valid_format and completion_tokens < empty_min_tokens:
             length_penalty = -1.0
         else:
             length_penalty = soft_overlong_penalty(completion_tokens, max_tokens,
@@ -224,14 +236,15 @@ def score_answer(completion: str, ground_truth: str, completion_tokens: int,
 def compute_rewards(completions: Sequence[str], ground_truths: Sequence[str],
                     completion_tokens: Sequence[int], truncated: Sequence[bool],
                     max_tokens: int, overlong_cache: int,
-                    enable_overlong: bool, format_weight: float = 0.2
+                    enable_overlong: bool, format_weight: float = 0.2,
+                    empty_min_tokens: int = 8
                     ) -> Tuple[List[float], List[ScoreResult]]:
     """Batch reward computation returning ``(combined, per_sample_results)``."""
     combined = []
     results = []
     for c, gt, nt, tr in zip(completions, ground_truths, completion_tokens, truncated):
         r = score_answer(c, gt, nt, max_tokens, overlong_cache, enable_overlong,
-                         tr, format_weight)
+                         tr, format_weight, empty_min_tokens)
         combined.append(r.shaped_reward)
         results.append(r)
     return combined, results

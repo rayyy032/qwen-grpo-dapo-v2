@@ -50,7 +50,7 @@ def grpo_loss(
     beta: float = 0.0,
     token_level: bool = False,
     ent_coef: float = 0.0,
-) -> Tuple[Tensor, float, float, float, float]:
+) -> Tuple[Tensor, float, float, float, float, float]:
     """GRPO / DAPO clipped surrogate objective.
 
     Args:
@@ -60,17 +60,25 @@ def grpo_loss(
         advantages: group-scoped advantage per sample, shape (G,).
         eps_low: lower clip bound factor -> ``1 - eps_low``.
         eps_high: upper clip bound factor -> ``1 + eps_high`` (clip-higher).
-        beta: KL penalty coefficient (KL(ref || policy)).
+        beta: KL penalty coefficient (applied on the k3 KL estimate).
         token_level: global token-mean reduction instead of sample-mean.
         ent_coef: entropy regularization strength (surprisal proxy).
 
     Returns:
-        loss, policy_loss (float), kl_penalty (float), clip_fraction (float),
+        loss, policy_loss (float), kl_penalty (float, beta-applied),
+        kl_estimate (float, raw k3 KL vs reference — always reported so the
+        KL monitor works even with beta = 0), clip_fraction (float),
         entropy (float).
+
+    KL is estimated with the k3 estimator ``mean(exp(d) - 1 - d)`` where
+    ``d = log p_new - log p_ref`` per token (computed in fp32 to avoid fp16
+    overflow).  Unlike the v1 signed log-ratio mean it is non-negative per
+    token and exactly zero when the policies match, so the KL trajectory is
+    interpretable as a divergence monitor.
     """
     n = len(new_log_probs)
     if n == 0:
-        return (torch.tensor(0.0), 0.0, 0.0, 0.0, 0.0)
+        return (torch.tensor(0.0), 0.0, 0.0, 0.0, 0.0, 0.0)
 
     clip_low = 1.0 - eps_low
     clip_high = 1.0 + eps_high
@@ -98,10 +106,12 @@ def grpo_loss(
         ratio_list.append(ratio)
         surr1_list.append(surr1)
         surr2_list.append(surr2)
-        kl_list.append(ref - new)
+        # k3 KL estimator per token: exp(d) - 1 - d with d = log new - log ref
+        delta = (new - ref).float()
+        kl_list.append(torch.exp(delta) - 1.0 - delta)
 
     if not surr1_list:
-        return (torch.tensor(0.0), 0.0, 0.0, 0.0, 0.0)
+        return (torch.tensor(0.0), 0.0, 0.0, 0.0, 0.0, 0.0)
 
     surr1_cat = torch.cat(surr1_list)
     surr2_cat = torch.cat(surr2_list)
@@ -119,7 +129,8 @@ def grpo_loss(
                         for s1, s2 in zip(surr1_list, surr2_list)]
         policy_loss = torch.stack(sample_means).mean()
 
-    kl_penalty = beta * kl_cat.mean()
+    kl_estimate = kl_cat.mean()
+    kl_penalty = beta * kl_estimate
 
     # Entropy proxy = mean sampled-token surprisal ``mean(-log p)`` over every
     # completion token. Built from the in-graph tensor so the gradient flows
@@ -136,4 +147,5 @@ def grpo_loss(
         clip_fraction = float((surr2_cat < surr1_cat).float().mean())
 
     return (loss, float(policy_loss.detach().item()),
-            float(kl_penalty.detach().item()), clip_fraction, entropy)
+            float(kl_penalty.detach().item()),
+            float(kl_estimate.detach().item()), clip_fraction, entropy)

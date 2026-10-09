@@ -89,8 +89,13 @@ def batch_generate(model, tokenizer, prompts, max_new_tokens=256, temperature=1.
 
 def compute_log_probs_for_tokens(model, full_ids, response_spans,
                                  attention_mask=None, use_amp=False,
-                                 device="cuda"):
+                                 device="cuda", row_chunk=8):
     """Per-token log-probs of each row's response span.
+
+    Rows are forwarded in chunks of ``row_chunk`` so the (batch, seq, vocab)
+    log-softmax activation is only ever materialized for a slice — with the
+    v2 rollout budget (32 completions x up to 512+384 tokens, 152k vocab) a
+    single full-batch forward would blow past 16GB.
 
     Args:
         response_spans: list of (start, end) positions from ``batch_generate``.
@@ -104,22 +109,76 @@ def compute_log_probs_for_tokens(model, full_ids, response_spans,
 
     device_type = "cuda" if "cuda" in str(device) else (
         "mps" if "mps" in str(device) else "cpu")
-    with autocast(device_type=device_type, enabled=use_amp):
-        outputs = model(input_ids=full_ids, attention_mask=attention_mask)
-        logits = outputs.logits
+    n = len(response_spans)
+    log_probs_list: list = [None] * n  # type: ignore[assignment]
 
-    log_probs_all = torch.log_softmax(logits, dim=-1)
-
-    log_probs_list = []
-    for i, (start, end) in enumerate(response_spans):
-        if end <= start or start < 1:
-            log_probs_list.append(torch.tensor([], device=device))
-            continue
-        response_token_ids = full_ids[i, start:end]
-        # logits at position t predict token t+1 -> shift by one
-        logits_for_response = log_probs_all[i, start - 1: end - 1, :]
-        token_log_probs = logits_for_response.gather(
-            1, response_token_ids.unsqueeze(1)).squeeze(1)
-        log_probs_list.append(token_log_probs)
+    for s in range(0, n, row_chunk):
+        e = min(s + row_chunk, n)
+        with autocast(device_type=device_type, enabled=use_amp):
+            outputs = model(
+                input_ids=full_ids[s:e],
+                attention_mask=attention_mask[s:e]
+                if attention_mask is not None else None)
+            logits = outputs.logits
+        log_probs_all = torch.log_softmax(logits, dim=-1)
+        for i in range(s, e):
+            start, end = response_spans[i]
+            if end <= start or start < 1:
+                log_probs_list[i] = torch.tensor([], device=device)
+                continue
+            response_token_ids = full_ids[i, start:end]
+            # logits at position t predict token t+1 -> shift by one
+            logits_for_response = log_probs_all[i - s, start - 1: end - 1, :]
+            token_log_probs = logits_for_response.gather(
+                1, response_token_ids.unsqueeze(1)).squeeze(1)
+            log_probs_list[i] = token_log_probs
+        del outputs, logits, log_probs_all
 
     return log_probs_list
+
+
+@torch.no_grad()
+def compute_entropy_for_tokens(model, full_ids, response_spans,
+                               attention_mask=None, use_amp=False,
+                               device="cuda", row_chunk=2):
+    """True policy entropy over the full vocabulary at response positions.
+
+    ``H(p) = -sum_v p(v) log p(v)``, averaged over every sampled response
+    token.  This complements the sampled-token surprisal proxy (which only
+    sees the probabilities of tokens that were actually drawn) with the real
+    distribution-level entropy used to detect policy collapse.
+
+    Computed as ``H = logsumexp(z) - sum_v softmax(z)_v * z_v`` to avoid
+    materializing an extra vocab-sized copy, in chunks of ``row_chunk``
+    (small default: entropy probes run under no_grad but the vocab is 152k).
+    """
+    full_ids = full_ids.to(device)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    device_type = "cuda" if "cuda" in str(device) else (
+        "mps" if "mps" in str(device) else "cpu")
+    total = 0.0
+    count = 0
+
+    for s in range(0, len(response_spans), row_chunk):
+        e = min(s + row_chunk, len(response_spans))
+        with autocast(device_type=device_type, enabled=use_amp):
+            outputs = model(
+                input_ids=full_ids[s:e],
+                attention_mask=attention_mask[s:e]
+                if attention_mask is not None else None)
+            logits = outputs.logits.float()
+        probs = torch.softmax(logits, dim=-1)
+        pos_entropy = torch.logsumexp(logits, dim=-1) \
+            - (probs * logits).sum(-1)
+        for i in range(s, e):
+            start, end = response_spans[i]
+            if end <= start or start < 1:
+                continue
+            seg = pos_entropy[i - s, start - 1: end - 1]
+            total += float(seg.sum().item())
+            count += int(seg.numel())
+        del outputs, logits, probs, pos_entropy
+
+    return total / max(count, 1)

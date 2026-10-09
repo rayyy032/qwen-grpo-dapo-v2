@@ -77,8 +77,8 @@ class Config:
     ppo_epochs: int = 1
     max_grad_norm: float = 1.0
     group_size: int = 8
-    groups_per_step: int = 2
-    max_new_tokens: int = 256                # response generation budget
+    groups_per_step: int = 4                  # 32 rollouts/step (v1 used 2: too noisy)
+    max_new_tokens: int = 384                # response budget (256 was too tight for MATH)
     max_prompt_tokens: int = 512             # prompt truncation limit
     temperature: float = 1.0
     max_steps: int = 100
@@ -87,17 +87,21 @@ class Config:
     # ---- reward ------------------------------------------------------------
     overlong_cache: int = 128                # soft zone width before response budget
     format_weight: float = 0.2
+    empty_min_tokens: int = 8                # shorter + format-less = degenerate -> -1 floor
+                                              # (overlong module fix: prevents the
+                                              #  "output nothing" death spiral)
 
     # ---- data --------------------------------------------------------------
     dataset: str = "synthetic"               # synthetic | gsm8k | gsm8k_math | /path/to.jsonl
     train_samples: int = 500
     eval_samples: int = 100
+    math_ratio: float = 0.5                  # gsm8k_math mix: fraction of MATH samples
 
     # ---- eval / logging / checkpoint --------------------------------------
     pass_at_k: int = 0                          # 0 disables; e.g. 8 -> pass@8
     pass_k_samples: int = 50                    # prompts used for the pass@k estimate
-    eval_every: int = 10
-    save_every: int = 50
+    eval_every: int = 50                        # mid-run greedy eval cadence (0 = off)
+    save_every: int = 50                        # periodic checkpoint cadence
     use_swanlab: bool = True
     swanlab_project: str = "qwen-math-grpo-dapo"
     run_name: str = ""

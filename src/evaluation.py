@@ -12,22 +12,29 @@ from src.rewards import score_answer
 @torch.no_grad()
 def evaluate_model(agent, eval_data, max_new_tokens=256, overlong_cache=128,
                    enable_overlong=False, format_weight=0.2,
-                   pass_k=0, pass_k_samples=50, pass_k_temperature=1.0):
+                   pass_k=0, pass_k_samples=50, pass_k_temperature=1.0,
+                   empty_min_tokens=8, verbose=True):
     """Evaluate accuracy / format rate on ``eval_data`` (near-greedy decode).
+
+    Results are stratified by ``data_source`` (gsm8k / math) and by ``level``
+    (difficulty tiers of the mixed dataset), so pass@k claims can be made
+    per difficulty stratum ("GSM8K pass@1 ...").
 
     When ``pass_k`` > 1, additionally estimates pass@k on the first
     ``pass_k_samples`` prompts: each prompt is sampled ``pass_k`` times at
     ``pass_k_temperature`` and counts as a hit if *any* sample is correct
-    (k == n, so the estimator is exact rather than the hypergeometric bound).
+    (k == n, so the estimator is exact rather than the hypergeometric bound),
+    reported overall and per ``data_source``.
 
-    Returns a dict with ``accuracy``, ``format_rate``, ``per_source`` and,
-    when enabled, ``pass@k``.
+    Returns a dict with ``accuracy``, ``format_rate``, ``per_source``,
+    ``per_level`` and, when enabled, ``pass@k`` (+ ``pass@k_per_source``).
     """
     agent.policy_model.eval()
     n = len(eval_data)
     correct = 0
     valid_format = 0
     per_source = defaultdict(lambda: [0, 0])  # source -> [correct, total]
+    per_level = defaultdict(lambda: [0, 0])    # level -> [correct, total]
 
     # near-greedy: temperature ~0 under do_sample=True, batched for throughput
     chunk = 32
@@ -40,17 +47,23 @@ def evaluate_model(agent, eval_data, max_new_tokens=256, overlong_cache=128,
         for s, resp, cl, tr in zip(batch, responses, comp_lens, truncated):
             r = score_answer(resp, s["ground_truth"], cl, max_new_tokens,
                              overlong_cache, enable_overlong, tr,
-                             format_weight)
+                             format_weight, empty_min_tokens)
             correct += int(r.correct)
             valid_format += int(r.valid_format)
-            per_source[s.get("data_source", "unknown")][0] += int(r.correct)
-            per_source[s.get("data_source", "unknown")][1] += 1
-        print(f"[progress] eval greedy {min(i + chunk, n)}/{n}", flush=True)
+            src = s.get("data_source", "unknown")
+            per_source[src][0] += int(r.correct)
+            per_source[src][1] += 1
+            lv = str(s.get("level", "unknown"))
+            per_level[lv][0] += int(r.correct)
+            per_level[lv][1] += 1
+        if verbose:
+            print(f"[progress] eval greedy {min(i + chunk, n)}/{n}", flush=True)
 
     result = {
         "accuracy": round(correct / max(n, 1), 4),
         "format_rate": round(valid_format / max(n, 1), 4),
         "per_source": {k: round(v[0] / v[1], 4) for k, v in per_source.items()},
+        "per_level": {k: round(v[0] / v[1], 4) for k, v in per_level.items()},
     }
 
     if pass_k > 1 and eval_data:
@@ -71,12 +84,21 @@ def evaluate_model(agent, eval_data, max_new_tokens=256, overlong_cache=128,
             for j, (resp, gt) in enumerate(zip(responses, batch_g)):
                 r = score_answer(resp, gt, comp_lens[j], max_new_tokens,
                                  overlong_cache, enable_overlong,
-                                 truncated[j], format_weight)
+                                 truncated[j], format_weight, empty_min_tokens)
                 if r.correct:
                     any_correct[(i + j) // pass_k] = True
-            print(f"[progress] eval pass@{pass_k} "
-                  f"{min(i + chunk, len(prompts))}/{len(prompts)}", flush=True)
+            if verbose:
+                print(f"[progress] eval pass@{pass_k} "
+                      f"{min(i + chunk, len(prompts))}/{len(prompts)}",
+                      flush=True)
         result[f"pass@{pass_k}"] = round(
             sum(any_correct) / max(len(subset), 1), 4)
+        hits_by_src = defaultdict(lambda: [0, 0])
+        for s, hit in zip(subset, any_correct):
+            key = s.get("data_source", "unknown")
+            hits_by_src[key][0] += int(hit)
+            hits_by_src[key][1] += 1
+        result[f"pass@{pass_k}_per_source"] = {
+            k: round(v[0] / v[1], 4) for k, v in hits_by_src.items()}
 
     return result

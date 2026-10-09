@@ -4,14 +4,15 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from src.generation import batch_generate, compute_log_probs_for_tokens
+from src.generation import (batch_generate, compute_entropy_for_tokens,
+                            compute_log_probs_for_tokens)
 
 
 class BaseAgent(nn.Module):
     """Wraps a causal LM (Qwen2.5 family), optionally LoRA-wrapped."""
 
     def __init__(self, model_path: str, device: str = "cuda", lora_config=None,
-                 use_8bit: bool = False):
+                 use_8bit: bool = False, resume_adapter: str = None):
         super().__init__()
         self.device = torch.device(device)
 
@@ -33,7 +34,13 @@ class BaseAgent(nn.Module):
             self.policy_model.config.pad_token_id = self.tokenizer.pad_token_id
 
         if lora_config is not None:
-            self.policy_model = self._wrap_lora(self.policy_model, lora_config, use_8bit)
+            if resume_adapter is not None:
+                # resume: load a previously saved LoRA adapter as trainable
+                from peft import PeftModel
+                self.policy_model = PeftModel.from_pretrained(
+                    self.policy_model, resume_adapter, is_trainable=True)
+            else:
+                self.policy_model = self._wrap_lora(self.policy_model, lora_config, use_8bit)
 
         self.policy_model.to(self.device)
         self.policy_model.eval()
@@ -75,4 +82,20 @@ class BaseAgent(nn.Module):
             self.policy_model, full_ids, response_spans,
             attention_mask=attention_mask, use_amp=use_amp,
             device=str(self.device),
+        )
+
+    @torch.no_grad()
+    def policy_entropy(self, full_ids, response_spans, use_amp=False,
+                       row_chunk=2):
+        """True full-vocab policy entropy H(p) over the response span.
+
+        Called once per training step on a small probe batch (first rollout
+        group) to track the policy-entropy trajectory used for
+        collapse diagnostics.
+        """
+        attention_mask = (full_ids != self.tokenizer.pad_token_id).to(full_ids.device).long()
+        return compute_entropy_for_tokens(
+            self.policy_model, full_ids, response_spans,
+            attention_mask=attention_mask, use_amp=use_amp,
+            device=str(self.device), row_chunk=row_chunk,
         )
