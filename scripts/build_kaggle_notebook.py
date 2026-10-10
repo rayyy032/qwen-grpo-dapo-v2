@@ -192,10 +192,12 @@ import subprocess, threading, queue, json, time, os, sys, glob, shutil, tracebac
 REPO = "/kaggle/working/qwen-grpo-dapo-v2"
 T0 = time.time()
 results = {}
+_results_lock = threading.Lock()
 
 def save_results():
-    with open("/kaggle/working/wave_results.json", "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    with _results_lock:
+        with open("/kaggle/working/wave_results.json", "w") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
 def load_metrics(arm):
     rows = []
@@ -224,6 +226,14 @@ def latest_ckpt(arm):
 
 def summarize(arm):
     rows = load_metrics(arm)
+    # a watchdog kill + resume re-logs the overlapping steps; keep only the
+    # last record per (kind, step) so curves stay monotone and unduplicated
+    dedup = {}
+    for r in rows:
+        dedup[(r.get("kind"), r.get("step"))] = r
+    rows = sorted(dedup.values(),
+                  key=lambda r: (r.get("step") if r.get("step") is not None else 0,
+                                 str(r.get("kind"))))
     train = [r for r in rows if r.get("kind") == "train"]
     out = {
         "steps_done": len(train),
@@ -252,6 +262,16 @@ for src in glob.glob("/kaggle/input/*/outputs/runs/*") + \\
     if os.path.isdir(src) and not os.path.exists(dst):
         shutil.copytree(src, dst)
         print(f"[resume] copied {src} -> {dst}")
+
+# ---- 单进程预下载模型 + 数据集（避免双臂并发抢 HF cache/下载锁） -----------
+print("=== pre-download (single process) ===", flush=True)
+os.chdir(REPO)
+from huggingface_hub import snapshot_download
+snapshot_download("Qwen/Qwen2.5-0.5B-Instruct")
+from src.data import build_dataset
+build_dataset(DATASET, TRAIN_SAMPLES, split="train", seed=42, math_ratio=MATH_RATIO)
+build_dataset(DATASET, EVAL_SAMPLES, split="test", seed=42, math_ratio=MATH_RATIO)
+print("pre-download done", flush=True)
 
 def run_arm(arm, gpu_id):
     env_arm = os.environ.copy()
@@ -306,6 +326,8 @@ def run_arm(arm, gpu_id):
             def pump_err():
                 for line in proc.stderr:
                     err_lines.append(line.rstrip("\\n"))
+                    if len(err_lines) > 3000:  # bounded memory for chatty stderr
+                        del err_lines[:1500]
 
             threading.Thread(target=pump_out, daemon=True).start()
             threading.Thread(target=pump_err, daemon=True).start()
@@ -328,7 +350,7 @@ def run_arm(arm, gpu_id):
                 if now - last_active > QUIET_KILL_MIN * 60:
                     kill_reason = f"watchdog: {QUIET_KILL_MIN}min 无输出"
                     break
-                if now - t0 > (WAVE_DEADLINE_H * 3600) - (time.time() - T0):
+                if time.time() - T0 > WAVE_DEADLINE_H * 3600:
                     kill_reason = "wave deadline"
                     break
 
