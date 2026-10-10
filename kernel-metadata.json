@@ -1,0 +1,13 @@
+{
+  "id": "rickena/qwen-grpo-dapo-v2-run4",
+  "title": "qwen-grpo-dapo-v2-run4",
+  "code_file": "kaggle_run4.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": []
+}
